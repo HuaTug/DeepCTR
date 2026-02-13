@@ -11,10 +11,12 @@ Training sample schema:
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
 import pymysql
+from sqlalchemy import create_engine, text
 from config import (
     MYSQL_CONFIG,
     TABLE_AUTHOR_SCORES,
@@ -37,9 +39,31 @@ class DataGenerator:
 
     def __init__(self, mysql_config: Optional[dict] = None):
         self.mysql_config = mysql_config or MYSQL_CONFIG
+        self._engine = None
+
+    def _get_engine(self):
+        if self._engine is None:
+            cfg = self.mysql_config
+            password = quote_plus(cfg["password"])
+            url = f"mysql+pymysql://{cfg['user']}:{password}@{cfg['host']}:{cfg['port']}/{cfg['database']}?charset={cfg.get('charset', 'utf8mb4')}"
+            self._engine = create_engine(url)
+        return self._engine
 
     def _get_connection(self):
         return pymysql.connect(**self.mysql_config, cursorclass=pymysql.cursors.DictCursor)
+
+    def _read_sql(self, sql, params=None):
+        """Helper to execute pd.read_sql with SQLAlchemy engine, converting %s to :p0, :p1, ..."""
+        if params:
+            # Replace %s placeholders with named params :p0, :p1, ...
+            new_sql = sql
+            named_params = {}
+            for i, val in enumerate(params):
+                new_sql = new_sql.replace("%s", f":p{i}", 1)
+                named_params[f"p{i}"] = val
+            return pd.read_sql(text(new_sql), self._get_engine(), params=named_params)
+        else:
+            return pd.read_sql(text(sql), self._get_engine())
 
     # =====================================================
     # Main entry: generate training DataFrame
@@ -99,6 +123,10 @@ class DataGenerator:
                 df_exposure = df_exposure.merge(df_hot, on="video_id", how="left")
 
             logger.info(f"Training data shape: {df_exposure.shape}")
+            # Ensure label columns are numeric
+            for col in ["is_click", "is_finish", "is_like", "is_share"]:
+                if col in df_exposure.columns:
+                    df_exposure[col] = pd.to_numeric(df_exposure[col], errors="coerce").fillna(0).astype(int)
             logger.info(f"Positive ratio (is_click): {df_exposure['is_click'].mean():.4f}")
 
             return df_exposure
@@ -128,9 +156,9 @@ class DataGenerator:
                 re.exposure_time
             FROM {TABLE_RECOMMENDATION_EXPOSURES} re
             WHERE re.exposure_time >= %s
-            ORDER BY re.exposure_time DESC
+            ORDER BY re.exposure_time ASC
         """
-        df = pd.read_sql(sql, conn, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
+        df = self._read_sql(sql, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
         return df
 
     def _build_exposures_from_behaviors(self, conn, days: int) -> pd.DataFrame:
@@ -160,7 +188,7 @@ class DataGenerator:
             WHERE uvi.last_interact_at >= %s
                 AND uvi.click_count > 0
         """
-        df_pos = pd.read_sql(sql_positive, conn, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
+        df_pos = self._read_sql(sql_positive, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
 
         if df_pos.empty:
             # Try user_behaviors table
@@ -180,7 +208,7 @@ class DataGenerator:
                 FROM {TABLE_USER_BEHAVIORS} ub
                 WHERE ub.behavior_time >= %s
             """
-            df_pos = pd.read_sql(sql_behaviors, conn, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
+            df_pos = self._read_sql(sql_behaviors, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
 
         if df_pos.empty:
             return pd.DataFrame()
@@ -205,7 +233,7 @@ class DataGenerator:
         
         # Get all public video IDs
         sql = f"SELECT video_id FROM {TABLE_VIDEOS} WHERE open = 1 AND audit_status = 1 AND deleted_at IS NULL"
-        df_videos = pd.read_sql(sql, conn)
+        df_videos = self._read_sql(sql)
         all_video_ids = df_videos["video_id"].values
 
         if len(all_video_ids) == 0:
@@ -234,7 +262,7 @@ class DataGenerator:
                     "completion_rate": 0.0,
                     "recall_source": "negative_sample",
                     "position": 0,
-                    "exposure_time": datetime.now(),
+                    "exposure_time": df_pos["exposure_time"].iloc[rng.integers(0, len(df_pos))],
                 })
                 pos_set.add((uid, vid))
             attempts += 1
@@ -273,7 +301,7 @@ class DataGenerator:
             LEFT JOIN {TABLE_USER_PROFILES} up ON u.user_id = up.user_id
             WHERE u.user_id IN ({placeholders})
         """
-        df = pd.read_sql(sql, conn, params=user_ids)
+        df = self._read_sql(sql, params=user_ids)
         return df
 
     # =====================================================
@@ -316,7 +344,7 @@ class DataGenerator:
             LEFT JOIN {TABLE_VIDEO_FEATURES} vf ON v.video_id = vf.video_id
             WHERE v.video_id IN ({placeholders})
         """
-        df = pd.read_sql(sql, conn, params=video_ids)
+        df = self._read_sql(sql, params=video_ids)
         return df
 
     # =====================================================
@@ -339,7 +367,7 @@ class DataGenerator:
             FROM {TABLE_AUTHOR_SCORES}
             WHERE author_id IN ({placeholders})
         """
-        df = pd.read_sql(sql, conn, params=author_ids)
+        df = self._read_sql(sql, params=author_ids)
         return df
 
     # =====================================================
@@ -360,7 +388,7 @@ class DataGenerator:
             WHERE video_id IN ({placeholders})
                 AND time_window = '24h'
         """
-        df = pd.read_sql(sql, conn, params=video_ids)
+        df = self._read_sql(sql, params=video_ids)
         # Deduplicate (keep highest score)
         df = df.sort_values("video_hot_score", ascending=False).drop_duplicates("video_id", keep="first")
         return df
@@ -393,7 +421,7 @@ class DataGenerator:
                     ORDER BY behavior_time DESC
                     LIMIT %s
                 """
-                df = pd.read_sql(sql, conn, params=[uid, max_len])
+                df = self._read_sql(sql, params=[uid, max_len])
                 hist_ids = df["video_id"].tolist()
                 records.append({"user_id": uid, "hist_video_ids": hist_ids})
 

@@ -9,6 +9,7 @@ from config import (
     DENSE_FEATURES,
     DURATION_BUCKETS,
     DURATION_LABELS,
+    HASH_BUCKET_FEATURES,
     SEQUENCE_FEATURE,
     SEQUENCE_MAX_LEN,
     SPARSE_FEATURES,
@@ -93,12 +94,34 @@ class FeatureProcessor:
         if "device_type" not in df.columns:
             df["device_type"] = "mobile"
 
+        # --- Derived interaction features (cross features) ---
+        # User engagement vs video popularity mismatch
+        if "user_avg_watch_duration" in df.columns and "video_duration" in df.columns:
+            vid_dur = pd.to_numeric(df["video_duration"], errors="coerce").fillna(1).clip(lower=1)
+            usr_dur = pd.to_numeric(df["user_avg_watch_duration"], errors="coerce").fillna(0)
+            df["user_video_duration_ratio"] = usr_dur / vid_dur
+
+        # User activity level (log of total views)
+        if "user_total_view_count" in df.columns:
+            df["user_activity_log"] = np.log1p(pd.to_numeric(df["user_total_view_count"], errors="coerce").fillna(0))
+
+        # Video popularity (log of visit count)
+        if "video_visit_count" in df.columns:
+            df["video_popularity_log"] = np.log1p(pd.to_numeric(df["video_visit_count"], errors="coerce").fillna(0))
+
         # --- Fill NaN for sparse/dense features ---
         for col in SPARSE_FEATURES:
             if col in df.columns:
                 df[col] = df[col].fillna("unknown").astype(str)
             else:
                 df[col] = "unknown"
+
+        # --- Hash bucket for high-cardinality ID features ---
+        for col, bucket_size in HASH_BUCKET_FEATURES.items():
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: hash(str(x)) % bucket_size)
+            else:
+                df[col] = 0
 
         for col in DENSE_FEATURES:
             if col in df.columns:
@@ -161,16 +184,18 @@ class FeatureProcessor:
         sparse_feature_columns = []
         dense_feature_columns = []
 
-        # Sparse features
+        # Regular sparse features (label-encoded)
         for feat in SPARSE_FEATURES:
             vocab_size = df[feat].nunique() + 1  # +1 for unknown
-            # Use larger embedding for high-cardinality features
-            if feat in ("user_id", "video_id", "author_id"):
-                emb_dim = 16
-            else:
-                emb_dim = 8
+            emb_dim = 8
             sparse_feature_columns.append(
                 SparseFeat(feat, vocabulary_size=vocab_size, embedding_dim=emb_dim)
+            )
+
+        # Hash bucket ID features
+        for feat, bucket_size in HASH_BUCKET_FEATURES.items():
+            sparse_feature_columns.append(
+                SparseFeat(feat, vocabulary_size=bucket_size, embedding_dim=8)
             )
 
         # Dense features
@@ -193,7 +218,7 @@ class FeatureProcessor:
         vocab_size = len(vid_le.classes_) + 1
 
         seq_feature = VarLenSparseFeat(
-            SparseFeat(hist_col, vocabulary_size=vocab_size, embedding_dim=16,
+            SparseFeat(hist_col, vocabulary_size=vocab_size, embedding_dim=8,
                        embedding_name="video_id"),  # share embedding with video_id
             maxlen=SEQUENCE_MAX_LEN,
             combiner="mean",
@@ -210,6 +235,10 @@ class FeatureProcessor:
         model_input = {}
 
         for feat in SPARSE_FEATURES:
+            if feat in df.columns:
+                model_input[feat] = df[feat].values
+
+        for feat in HASH_BUCKET_FEATURES:
             if feat in df.columns:
                 model_input[feat] = df[feat].values
 

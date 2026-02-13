@@ -51,9 +51,6 @@ TABLE_TOPICS = "topics"
 # =====================================================
 # Sparse features: categorical features that need embedding
 SPARSE_FEATURES = [
-    "user_id",
-    "video_id",
-    "author_id",
     "category",
     "user_sex",
     "user_level",
@@ -62,6 +59,13 @@ SPARSE_FEATURES = [
     "day_of_week",
     "device_type",
 ]
+
+# High-cardinality ID features: use hash bucket to limit embedding size
+HASH_BUCKET_FEATURES = {
+    "user_id": 500,
+    "video_id": 500,
+    "author_id": 200,
+}
 
 # Dense features: continuous numeric features
 DENSE_FEATURES = [
@@ -77,12 +81,8 @@ DENSE_FEATURES = [
     # Video features (from video_features + videos table)
     "video_quality_score",
     "video_popularity_score",
-    "video_ctr",
-    "video_finish_rate",
-    "video_like_rate",
-    "video_comment_rate",
-    "video_share_rate",
-    "video_favorite_rate",
+    # NOTE: removed video_ctr/finish_rate/like_rate/comment_rate/share_rate/favorite_rate
+    # These are aggregated from labels (is_click etc.) causing label leakage
     "video_avg_watch_duration",
     "video_duration",
     "video_visit_count",
@@ -98,6 +98,10 @@ DENSE_FEATURES = [
     # Context features
     "video_freshness_hours",
     "video_hot_score",
+    # Derived interaction features
+    "user_video_duration_ratio",
+    "user_activity_log",
+    "video_popularity_log",
 ]
 
 # Sequence features for DIN model (user behavior history)
@@ -110,25 +114,25 @@ SEQUENCE_MAX_LEN = 50
 MODEL_CONFIG = {
     "deepfm": {
         "embedding_dim": 8,
-        "dnn_hidden_units": (256, 128, 64),
-        "dnn_dropout": 0.3,
+        "dnn_hidden_units": (128, 64),
+        "dnn_dropout": 0.2,
         "l2_reg_embedding": 1e-5,
-        "l2_reg_dnn": 0,
+        "l2_reg_dnn": 1e-5,
     },
     "din": {
         "embedding_dim": 8,
-        "dnn_hidden_units": (256, 128, 64),
+        "dnn_hidden_units": (128, 64),
         "att_hidden_size": (64, 16),
         "att_activation": "Dice",
-        "dnn_dropout": 0.3,
+        "dnn_dropout": 0.2,
         "l2_reg_embedding": 1e-5,
     },
     "mmoe": {
         "embedding_dim": 8,
-        "dnn_hidden_units": (256, 128, 64),
-        "num_experts": 4,
-        "expert_dim": 128,
-        "dnn_dropout": 0.3,
+        "dnn_hidden_units": (128, 64),
+        "num_experts": 3,
+        "expert_dim": 64,
+        "dnn_dropout": 0.2,
         "task_names": ["is_click", "is_finish", "is_like", "is_share"],
         "task_types": ["binary", "binary", "binary", "binary"],
     },
@@ -138,11 +142,11 @@ MODEL_CONFIG = {
 # Training Configuration
 # =====================================================
 TRAINING_CONFIG = {
-    "batch_size": 1024,
-    "epochs": 10,
+    "batch_size": 256,
+    "epochs": 50,
     "validation_split": 0.2,
     "learning_rate": 1e-3,
-    "early_stopping_patience": 3,
+    "early_stopping_patience": 8,
     "min_interactions": 5,  # minimum interactions for a user to be in training data
     "train_days": 30,  # how many days of data to use for training
     "label_name": "is_click",  # primary label

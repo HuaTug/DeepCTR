@@ -648,15 +648,125 @@ def generate_recommendation_exposures(conn, user_ids, video_ids, n_per_user=30):
     Fill `recommendation_exposures` table with labeled exposure data.
     THIS IS THE CORE TRAINING DATA for DeepCTR models.
 
-    Maps to: RecommendationExposure struct in cmd/model/recommendation.go
-
-    Labels:
-      - is_clicked: primary CTR label
-      - is_liked, is_commented, is_shared, is_favorited: multi-task labels
-      - watch_duration, completion_rate: engagement labels
+    Click probability is computed from observable features so the model
+    can learn meaningful patterns:
+      - video quality & popularity → higher quality videos get more clicks
+      - user activity level → active users click more
+      - category match → users click more on preferred categories
+      - time context → certain hours have higher engagement
+      - position bias → earlier positions get more clicks
     """
     logger.info(f"Generating recommendation exposures ({n_per_user} per user)...")
 
+    # ---- Load feature tables into memory for feature-dependent click model ----
+    # Video features
+    video_feat = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT video_id, quality_score, popularity_score FROM video_features")
+        for row in cur.fetchall():
+            video_feat[row["video_id"]] = row
+
+    # Video metadata (category, duration, author)
+    video_meta = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT video_id, user_id AS author_id, category, duration FROM videos WHERE deleted_at IS NULL")
+        for row in cur.fetchall():
+            video_meta[row["video_id"]] = row
+
+    # User profiles
+    user_prof = {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT user_id, avg_watch_duration, avg_completion_rate, like_rate,
+                   total_view_count, user_level, interest_tags
+            FROM user_profiles
+        """)
+        for row in cur.fetchall():
+            user_prof[row["user_id"]] = row
+
+    # Author scores
+    author_sc = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT author_id, overall_score FROM author_scores")
+        for row in cur.fetchall():
+            author_sc[row["author_id"]] = row
+
+    # User following/follower counts
+    user_base = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id, following_count, follower_count FROM users")
+        for row in cur.fetchall():
+            user_base[row["user_id"]] = row
+
+    logger.info("  Feature tables loaded into memory for click model")
+
+    # ---- Helper: compute click probability from features ----
+    def _compute_click_prob(uid, vid, position, hour):
+        # Use logistic model: logit = sum of weighted signals, then sigmoid
+        logit = -2.5  # base logit (sigmoid(-2.5) ≈ 0.075, base CTR ~7.5%)
+
+        vf = video_feat.get(vid, {})
+        vm = video_meta.get(vid, {})
+        up = user_prof.get(uid, {})
+
+        # 1. Video quality: strongest signal (quality_score: 2-9.5)
+        quality = float(vf.get("quality_score", 5.0))
+        logit += (quality - 5.0) / 2.5 * 0.8  # range: -0.96 to +1.44
+
+        # 2. Video popularity (log-transformed)
+        pop = float(vf.get("popularity_score", 10.0))
+        logit += min(math.log1p(pop) / 5.0, 1.0) * 0.5
+
+        # 3. Category match: very strong signal
+        video_cat = vm.get("category", "")
+        interest_str = up.get("interest_tags", "{}")
+        try:
+            interests = json.loads(interest_str) if isinstance(interest_str, str) else interest_str
+        except (json.JSONDecodeError, TypeError):
+            interests = {}
+        if video_cat and video_cat in interests:
+            cat_weight = float(interests[video_cat])
+            logit += 0.6 + cat_weight * 0.8  # match: +0.6 to +1.4
+        else:
+            logit -= 0.5  # no match: penalty
+
+        # 4. User activity level
+        views = int(up.get("total_view_count", 100))
+        logit += min(math.log1p(views) / math.log1p(10000), 1.0) * 0.4
+
+        # 5. User level (1-5)
+        level = int(up.get("user_level", 1))
+        logit += (level - 3) / 2.0 * 0.3
+
+        # 6. Author quality
+        author_id = vm.get("author_id")
+        if author_id:
+            a_score = float(author_sc.get(author_id, {}).get("overall_score", 5.0))
+            logit += (a_score - 5.0) / 3.0 * 0.4
+
+        # 7. Position bias (moderate decay)
+        logit -= 0.02 * position
+
+        # 8. Time-of-day
+        if 18 <= hour <= 23:
+            logit += 0.2
+        elif 0 <= hour <= 6:
+            logit -= 0.3
+
+        # 9. Short video preference
+        vid_dur = int(vm.get("duration", 30))
+        if vid_dur <= 15:
+            logit += 0.2
+        elif vid_dur >= 180:
+            logit -= 0.2
+
+        # Sigmoid with moderate noise
+        noise = random.gauss(0, 0.3)
+        prob = 1.0 / (1.0 + math.exp(-(logit + noise)))
+
+        return max(0.01, min(prob, 0.75))
+
+    # ---- Generate exposures ----
     exposures = []
     batch_size = 5000
     total_inserted = 0
@@ -667,20 +777,24 @@ def generate_recommendation_exposures(conn, user_ids, video_ids, n_per_user=30):
 
         for pos, vid in enumerate(exposed_videos):
             recall_source = random.choice(RECALL_SOURCES)
-            score = round(random.uniform(0.1, 0.99), 6)
+            exposure_time = random_datetime(30, 0)
+            hour = exposure_time.hour
 
-            # Click probability depends on position and score
-            click_prob = score * math.exp(-0.05 * pos) * random.uniform(0.5, 1.5)
-            is_clicked = 1 if random.random() < min(click_prob, 0.5) else 0
+            # Feature-dependent click probability
+            click_prob = _compute_click_prob(uid, vid, pos, hour)
+            score = round(click_prob, 6)
+            is_clicked = 1 if random.random() < click_prob else 0
 
-            # Post-click behaviors (only if clicked)
+            # Post-click behaviors (probability also depends on video quality)
             if is_clicked:
+                vf = video_feat.get(vid, {})
+                q = float(vf.get("quality_score", 5.0)) / 10.0
                 watch_duration = random.randint(5, 300)
-                completion_rate = round(random.uniform(0.1, 1.0), 4)
-                is_liked = 1 if random.random() < 0.2 else 0
-                is_commented = 1 if random.random() < 0.05 else 0
-                is_shared = 1 if random.random() < 0.03 else 0
-                is_favorited = 1 if random.random() < 0.04 else 0
+                completion_rate = round(random.uniform(0.1, min(1.0, 0.3 + q * 0.7)), 4)
+                is_liked = 1 if random.random() < (0.1 + q * 0.15) else 0
+                is_commented = 1 if random.random() < (0.02 + q * 0.05) else 0
+                is_shared = 1 if random.random() < (0.01 + q * 0.04) else 0
+                is_favorited = 1 if random.random() < (0.02 + q * 0.05) else 0
             else:
                 watch_duration = 0
                 completion_rate = 0.0
@@ -689,7 +803,6 @@ def generate_recommendation_exposures(conn, user_ids, video_ids, n_per_user=30):
                 is_shared = 0
                 is_favorited = 0
 
-            exposure_time = random_datetime(30, 0)
             request_id = f"req_{uid}_{int(exposure_time.timestamp())}"
 
             exposures.append((
@@ -843,7 +956,7 @@ def update_category_video_stats(conn):
                 FROM videos
                 WHERE deleted_at IS NULL AND open = 1 AND category != ''
                 GROUP BY category
-            ) v ON cvs.category = v.category
+            ) v ON cvs.category = v.category COLLATE utf8mb4_unicode_ci
             SET
                 cvs.total_videos = v.total_videos,
                 cvs.total_views = v.total_views,
@@ -957,8 +1070,8 @@ def main():
     parser.add_argument("--videos", type=int, default=500, help="Number of videos (default: 500)")
     parser.add_argument("--behaviors-per-user", type=int, default=50,
                         help="Avg behaviors per user (default: 50)")
-    parser.add_argument("--exposures-per-user", type=int, default=30,
-                        help="Avg exposures per user (default: 30)")
+    parser.add_argument("--exposures-per-user", type=int, default=80,
+                        help="Avg exposures per user (default: 80)")
     parser.add_argument("--skip-core", action="store_true",
                         help="Skip core table generation (users/videos/behaviors)")
     parser.add_argument("--clean", action="store_true",

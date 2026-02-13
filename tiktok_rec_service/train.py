@@ -29,7 +29,7 @@ from config import (
 )
 from data_generator import DataGenerator
 from deepctr.models import DeepFM
-from deepctr.models.multitask.mmoe import MMoE
+from deepctr.models.multitask.mmoe import MMOE
 from deepctr.models.sequence.din import DIN
 from feature_engineering import FeatureProcessor
 
@@ -65,7 +65,7 @@ def train_deepfm(df_train, df_val, feature_processor: FeatureProcessor, model_di
     )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=TRAINING_CONFIG["learning_rate"]),
+        optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=TRAINING_CONFIG["learning_rate"]),
         loss="binary_crossentropy",
         metrics=["AUC", "binary_crossentropy"],
     )
@@ -156,7 +156,7 @@ def train_din(df_train, df_val, feature_processor: FeatureProcessor, model_dir: 
     )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=TRAINING_CONFIG["learning_rate"]),
+        optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=TRAINING_CONFIG["learning_rate"]),
         loss="binary_crossentropy",
         metrics=["AUC"],
     )
@@ -212,7 +212,7 @@ def train_mmoe(df_train, df_val, feature_processor: FeatureProcessor, model_dir:
 
     feature_columns = feature_processor.get_feature_columns()
 
-    model = MMoE(
+    model = MMOE(
         dnn_feature_columns=feature_columns,
         tower_dnn_hidden_units=[64, 32],
         num_experts=cfg["num_experts"],
@@ -223,7 +223,7 @@ def train_mmoe(df_train, df_val, feature_processor: FeatureProcessor, model_dir:
     )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=TRAINING_CONFIG["learning_rate"]),
+        optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=TRAINING_CONFIG["learning_rate"]),
         loss={
             "is_click": "binary_crossentropy",
             "is_finish": "binary_crossentropy",
@@ -325,24 +325,29 @@ def main():
     logger.info("=" * 60)
     logger.info("Step 2: Feature engineering...")
     logger.info("=" * 60)
+
+    # Step 3: Train/Val split
+    # Shuffle data since exposure_time in mock data is randomly generated
+    logger.info("=" * 60)
+    logger.info("Step 3: Train/Validation split...")
+    logger.info("=" * 60)
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    split_ratio = 1 - TRAINING_CONFIG["validation_split"]
+    split_idx = int(len(df) * split_ratio)
+    df_train_raw = df.iloc[:split_idx]
+    df_val_raw = df.iloc[split_idx:]
+    logger.info(f"Train: {len(df_train_raw)}, Val: {len(df_val_raw)}")
+
+    # Fit feature processor only on training data to avoid data leakage
     fp = FeatureProcessor()
-    df = fp.fit_transform(df)
+    df_train = fp.fit_transform(df_train_raw)
+    df_val = fp.transform(df_val_raw)
 
     # Save feature processor for serving
     fp_path = os.path.join(args.output, "feature_processor.pkl")
     with open(fp_path, "wb") as f:
         pickle.dump(fp, f)
     logger.info(f"Feature processor saved to {fp_path}")
-
-    # Step 3: Train/Val split (time-based to avoid leakage)
-    logger.info("=" * 60)
-    logger.info("Step 3: Train/Validation split...")
-    logger.info("=" * 60)
-    split_ratio = 1 - TRAINING_CONFIG["validation_split"]
-    split_idx = int(len(df) * split_ratio)
-    df_train = df.iloc[:split_idx]
-    df_val = df.iloc[split_idx:]
-    logger.info(f"Train: {len(df_train)}, Val: {len(df_val)}")
 
     # Step 4: Train models
     all_metrics = {}
@@ -379,7 +384,7 @@ def main():
             "total_samples": len(df),
             "train_samples": len(df_train),
             "val_samples": len(df_val),
-            "positive_ratio": float(df["is_click"].mean()),
+            "positive_ratio": float(df_train_raw["is_click"].mean()),
             "models": all_metrics,
         }, f, indent=2)
     logger.info(f"Training metrics saved to {metrics_path}")

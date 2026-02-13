@@ -150,9 +150,9 @@ class ModelManager:
                     task="binary",
                 )
             elif model_name == "mmoe":
-                from deepctr.models.multitask.mmoe import MMoE
+                from deepctr.models.multitask.mmoe import MMOE
                 cfg = MODEL_CONFIG["mmoe"]
-                model = MMoE(
+                model = MMOE(
                     dnn_feature_columns=feature_columns,
                     tower_dnn_hidden_units=[64, 32],
                     num_experts=cfg["num_experts"],
@@ -208,8 +208,9 @@ class ModelManager:
         if df.empty:
             return self._fallback_predictions(video_ids)
 
-        # Transform features
+        # Transform features (preserve original video_id for matching)
         try:
+            df["_orig_video_id"] = df["video_id"].values.copy()
             df = self.feature_processor.transform(df)
         except Exception as e:
             logger.error(f"Feature transform failed: {e}")
@@ -229,7 +230,7 @@ class ModelManager:
                 # MMoE returns [click_pred, finish_pred, like_pred, share_pred]
                 results = []
                 for i, vid in enumerate(video_ids):
-                    idx = df.index[df["video_id"] == vid]
+                    idx = df.index[df["_orig_video_id"] == vid]
                     if len(idx) == 0:
                         results.append(self._default_prediction(vid))
                         continue
@@ -254,7 +255,7 @@ class ModelManager:
                 preds = model.predict(model_input, batch_size=len(video_ids))
                 results = []
                 for i, vid in enumerate(video_ids):
-                    idx = df.index[df["video_id"] == vid]
+                    idx = df.index[df["_orig_video_id"] == vid]
                     if len(idx) == 0:
                         results.append(self._default_prediction(vid))
                         continue

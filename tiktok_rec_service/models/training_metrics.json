@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-02-13T16:55:36.701405",
+  "total_samples": 29843,
+  "train_samples": 23874,
+  "val_samples": 5969,
+  "positive_ratio": 0.08000335092569322,
+  "models": {
+    "deepfm": {
+      "auc": 0.6399297197471332,
+      "logloss": 0.2656195525439156
+    }
+  }
+}
