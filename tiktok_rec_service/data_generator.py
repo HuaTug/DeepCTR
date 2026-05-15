@@ -24,6 +24,7 @@ from config import (
     TABLE_USER_BEHAVIORS,
     TABLE_USER_PROFILES,
     TABLE_USER_VIDEO_INTERACTIONS,
+    TABLE_USER_VIDEO_WATCH_HISTORY,
     TABLE_USERS,
     TABLE_VIDEO_FEATURES,
     TABLE_VIDEO_HOT_SCORES,
@@ -163,15 +164,21 @@ class DataGenerator:
 
     def _build_exposures_from_behaviors(self, conn, days: int) -> pd.DataFrame:
         """
-        Fallback: build pseudo-exposure data from user_behaviors and
-        user_video_interactions when recommendation_exposures is empty.
-        This creates positive samples from actual interactions and
-        generates negative samples by random sampling.
+        Fallback: build pseudo-exposure data from multiple interaction tables
+        when recommendation_exposures is empty.
+        Aggregates positive samples from:
+          1. user_video_interactions (explicit clicks)
+          2. user_behaviors (view/like/share/comment)
+          3. user_video_watch_histories (implicit watch feedback)
+        Then generates negative samples at a controlled ratio for realistic CTR distribution.
         """
         cutoff = datetime.now() - timedelta(days=days)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Positive samples from user_video_interactions
-        sql_positive = f"""
+        dfs_pos = []
+
+        # Source 1: user_video_interactions (explicit clicks)
+        sql_uvi = f"""
             SELECT
                 uvi.user_id,
                 uvi.video_id,
@@ -181,44 +188,71 @@ class DataGenerator:
                 CAST(uvi.is_shared AS SIGNED) AS is_share,
                 uvi.total_watch_time AS watch_duration,
                 uvi.max_watch_progress AS completion_rate,
-                'behavior' AS recall_source,
+                'interaction' AS recall_source,
                 0 AS position,
                 uvi.last_interact_at AS exposure_time
             FROM {TABLE_USER_VIDEO_INTERACTIONS} uvi
             WHERE uvi.last_interact_at >= %s
                 AND uvi.click_count > 0
         """
-        df_pos = self._read_sql(sql_positive, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
+        df_uvi = self._read_sql(sql_uvi, params=[cutoff_str])
+        if not df_uvi.empty:
+            dfs_pos.append(df_uvi)
 
-        if df_pos.empty:
-            # Try user_behaviors table
-            sql_behaviors = f"""
-                SELECT
-                    ub.user_id,
-                    ub.video_id,
-                    1 AS is_click,
-                    CASE WHEN ub.behavior_type = 'view' THEN 0 ELSE 0 END AS is_finish,
-                    CASE WHEN ub.behavior_type = 'like' THEN 1 ELSE 0 END AS is_like,
-                    CASE WHEN ub.behavior_type = 'share' THEN 1 ELSE 0 END AS is_share,
-                    0 AS watch_duration,
-                    0.0 AS completion_rate,
-                    'behavior' AS recall_source,
-                    0 AS position,
-                    ub.behavior_time AS exposure_time
-                FROM {TABLE_USER_BEHAVIORS} ub
-                WHERE ub.behavior_time >= %s
-            """
-            df_pos = self._read_sql(sql_behaviors, params=[cutoff.strftime("%Y-%m-%d %H:%M:%S")])
+        # Source 2: user_behaviors (view/like/share/comment)
+        sql_behaviors = f"""
+            SELECT
+                ub.user_id,
+                ub.video_id,
+                1 AS is_click,
+                CASE WHEN ub.behavior_type = 'view' THEN 0 ELSE 0 END AS is_finish,
+                CASE WHEN ub.behavior_type = 'like' THEN 1 ELSE 0 END AS is_like,
+                CASE WHEN ub.behavior_type = 'share' THEN 1 ELSE 0 END AS is_share,
+                0 AS watch_duration,
+                0.0 AS completion_rate,
+                'behavior' AS recall_source,
+                0 AS position,
+                ub.behavior_time AS exposure_time
+            FROM {TABLE_USER_BEHAVIORS} ub
+            WHERE ub.behavior_time >= %s
+        """
+        df_beh = self._read_sql(sql_behaviors, params=[cutoff_str])
+        if not df_beh.empty:
+            dfs_pos.append(df_beh)
 
-        if df_pos.empty:
+        # Source 3: user_video_watch_histories (implicit positive from watching)
+        sql_watch = f"""
+            SELECT
+                wh.user_id,
+                wh.video_id,
+                1 AS is_click,
+                CASE WHEN wh.completion_rate >= 0.8 THEN 1 ELSE 0 END AS is_finish,
+                0 AS is_like,
+                0 AS is_share,
+                COALESCE(wh.watch_duration, 0) AS watch_duration,
+                COALESCE(wh.completion_rate, 0) AS completion_rate,
+                'watch_history' AS recall_source,
+                0 AS position,
+                wh.watch_time AS exposure_time
+            FROM {TABLE_USER_VIDEO_WATCH_HISTORY} wh
+            WHERE wh.watch_time >= %s
+        """
+        df_watch = self._read_sql(sql_watch, params=[cutoff_str])
+        if not df_watch.empty:
+            dfs_pos.append(df_watch)
+
+        if not dfs_pos:
             return pd.DataFrame()
+
+        # Merge all positive sources
+        df_pos = pd.concat(dfs_pos, ignore_index=True)
 
         # Deduplicate positive samples (keep the latest interaction)
         df_pos = df_pos.sort_values("exposure_time", ascending=False)
         df_pos = df_pos.drop_duplicates(subset=["user_id", "video_id"], keep="first")
 
         # Generate negative samples (random user-video pairs that did NOT interact)
-        n_neg = min(len(df_pos) * 4, 100000)  # 4:1 negative ratio, max 100k
+        n_neg = min(int(len(df_pos) * 1.5), 100000)  # 1.5:1 negative ratio for ~40% positive rate
         df_neg = self._generate_negative_samples(conn, df_pos, n_neg)
 
         df = pd.concat([df_pos, df_neg], ignore_index=True)

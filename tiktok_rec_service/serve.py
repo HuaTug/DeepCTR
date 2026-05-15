@@ -436,6 +436,43 @@ async def metrics():
     )
 
 
+@app.post("/reload")
+async def reload_models():
+    """
+    热加载训练好的最新模型权重 + feature_processor.pkl。
+    用于 train.py 跑完后无需重启服务即可让线上推理使用新模型。
+
+    注意：当前实现是"重新构造 ModelManager"——TF Keras 模型的 weights
+    必须用相同的 feature_columns 才能 load。如果训练时改了 SPARSE/DENSE/HASH
+    特征列，新旧 model 结构不一致，需要重启服务而不是 /reload。
+
+    返回 200 OK + 加载到的模型列表，失败返回 500 + 错误信息。
+    """
+    global model_manager
+    try:
+        old_mgr = model_manager
+        old_models = list(old_mgr.models.keys()) if old_mgr else []
+
+        # 重新构造 ModelManager 会重新读 feature_processor.pkl + .h5 权重
+        new_mgr = ModelManager(SERVING_CONFIG["model_dir"])
+        if not new_mgr.models:
+            raise RuntimeError("no models loaded after reload, aborting")
+
+        # 原子替换
+        model_manager = new_mgr
+        new_models = list(new_mgr.models.keys())
+        logger.info(f"[/reload] models reloaded: old={old_models} -> new={new_models}")
+        return {
+            "status": "ok",
+            "old_models": old_models,
+            "new_models": new_models,
+            "uptime_seconds": round(time.time() - new_mgr.start_time, 1),
+        }
+    except Exception as e:
+        logger.exception("[/reload] failed")
+        raise HTTPException(status_code=500, detail=f"reload failed: {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Pre-load models on startup."""

@@ -61,10 +61,12 @@ SPARSE_FEATURES = [
 ]
 
 # High-cardinality ID features: use hash bucket to limit embedding size
+# NOTE: 因为当前测试用户只有 ~10 个，hash bucket 500 会导致 user/video embedding 极度稀疏，
+# 模型学不到 user×video 交叉。缩小桶让 embedding 更密集。
 HASH_BUCKET_FEATURES = {
-    "user_id": 500,
-    "video_id": 500,
-    "author_id": 200,
+    "user_id": 64,
+    "video_id": 128,
+    "author_id": 64,
 }
 
 # Dense features: continuous numeric features
